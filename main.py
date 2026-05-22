@@ -1,280 +1,291 @@
 #!/usr/bin/env python3
 """
-SSH Deployment Automation Tool
-Monitors and automates SSH key deployment for squad agents.
-Checks connectivity, authentication status, and generates deployment scripts.
+SSH Deployer Automation
+Automates the full SSH key deployment workflow for squad agents.
+
+Features:
+- Checks current deployment status
+- Deploys keys to agents that need them
+- Verifies deployment success
+- Saves status to memory for squad digest
+- Supports both interactive and automated modes
 """
 
-import json
 import subprocess
+import json
 import sys
+import os
 from datetime import datetime
 from pathlib import Path
 
-# Squad agents configuration
-AGENTS = {
-    "Seneca": {
-        "hostname": "lobster-1",
-        "ip": "100.101.15.68",
-        "user": "exedev",
-        "role": "Research Lead",
-        "identity_file": "~/.ssh/id_ed25519"
-    },
-    "Marcus": {
-        "hostname": "marcus-squad",
-        "ip": "100.98.223.103",
-        "user": "exedev",
-        "role": "Research - AI/ML",
-        "identity_file": "~/.ssh/id_ed25519"
-    },
-    "Galen": {
-        "hostname": "galen-squad",
-        "ip": "100.123.121.125",
-        "user": "exedev",
-        "role": "Research - Biotech",
-        "identity_file": "~/.ssh/id_ed25519"
-    },
-    "Argus": {
-        "hostname": "argus-squad",
-        "ip": "100.108.219.91",
-        "user": "exedev",
-        "role": "Ops",
-        "identity_file": "~/.ssh/id_ed25519"
-    }
-}
+# Paths
+WORKSPACE = Path.home() / ".openclaw" / "workspace"
+SSH_DEPLOYER = WORKSPACE / "tools" / "ssh-key-deployer"
+SSH_STATUS = WORKSPACE / "tools" / "squad-ssh-status"
+MEMORY_DIR = WORKSPACE / "memory"
 
-# State file for tracking deployment progress
-STATE_FILE = Path.home() / ".openclaw" / "workspace" / "memory" / "ssh-deployment-state.json"
+# Agent list (squad members)
+AGENTS = ["Seneca", "Galen", "Argus", "Marcus"]
 
-def load_state():
-    """Load deployment state from JSON file"""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+class Colors:
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    RED = '\033[0;31m'
+    BLUE = '\033[0;34m'
+    NC = '\033[0m'  # No Color
 
-def save_state(state):
-    """Save deployment state to JSON file"""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
+def log_info(msg):
+    print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
 
-def check_ssh_connection(hostname, user, identity_file):
-    """Check if SSH connection works (no password required)"""
+def log_warn(msg):
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}")
+
+def log_error(msg):
+    print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}")
+
+def log_step(msg):
+    print(f"{Colors.BLUE}[STEP]{Colors.NC} {msg}")
+
+def check_status():
+    """Check current SSH key deployment status."""
+    log_step("Checking SSH key deployment status...")
+
+    status_file = SSH_STATUS / "main.py"
+    if not status_file.exists():
+        log_error(f"Status tool not found: {status_file}")
+        return None
+
     try:
-        cmd = [
-            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-            f"{user}@{hostname}", "echo 'OK'"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and "OK" in result.stdout:
-            return True, result.stderr
-        return False, result.stderr
+        result = subprocess.run(
+            ["python3", str(status_file), "--check"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        print(result.stdout)
+
+        # Parse status
+        deployed = []
+        not_deployed = []
+
+        for agent in AGENTS:
+            if agent.lower() in result.stdout.lower() and "not deployed" in result.stdout.lower():
+                not_deployed.append(agent)
+            elif agent.lower() in result.stdout.lower() and "deployed" in result.stdout.lower():
+                deployed.append(agent)
+
+        return {
+            "deployed": deployed,
+            "not_deployed": not_deployed,
+            "raw_output": result.stdout
+        }
     except subprocess.TimeoutExpired:
-        return False, "Connection timeout"
+        log_error("Status check timed out")
+        return None
     except Exception as e:
-        return False, str(e)
+        log_error(f"Error checking status: {e}")
+        return None
 
-def get_deployment_status():
-    """Get current deployment status for all agents"""
-    status = {}
-    state = load_state()
-    
-    for agent_name, config in AGENTS.items():
-        hostname = config["hostname"]
-        user = config["user"]
-        identity_file = config["identity_file"]
-        
-        # Check SSH connection
-        connected, error = check_ssh_connection(hostname, user, identity_file)
-        
-        # Determine status
-        if connected:
-            status[agent_name] = {
-                "connected": True,
-                "auth_ok": True,
-                "error": None,
-                "last_check": datetime.now().isoformat(),
-                "role": config["role"],
-                "ip": config["ip"]
-            }
-        else:
-            # Parse error to determine if host is down or auth failed
-            if "Connection refused" in error or "timed out" in error or "timeout" in error.lower():
-                status[agent_name] = {
-                    "connected": False,
-                    "auth_ok": False,
-                    "error": "Host unreachable or SSH not running",
-                    "last_check": datetime.now().isoformat(),
-                    "role": config["role"],
-                    "ip": config["ip"]
-                }
-            elif "Permission denied" in error:
-                status[agent_name] = {
-                    "connected": True,
-                    "auth_ok": False,
-                    "error": "SSH key not in authorized_keys",
-                    "last_check": datetime.now().isoformat(),
-                    "role": config["role"],
-                    "ip": config["ip"]
-                }
-            else:
-                status[agent_name] = {
-                    "connected": False,
-                    "auth_ok": False,
-                    "error": error,
-                    "last_check": datetime.now().isoformat(),
-                    "role": config["role"],
-                    "ip": config["ip"]
-                }
-    
-    return status
+def deploy_keys(agents=None, auto=False):
+    """Deploy SSH keys to specified agents or all that need them."""
+    status = check_status()
+    if not status:
+        return False
 
-def print_status(status, json_output=False):
-    """Print deployment status"""
-    if json_output:
-        print(json.dumps(status, indent=2))
-        return
-    
-    print("\n" + "=" * 60)
-    print("  SSH Key Deployment Status")
-    print("=" * 60)
-    print()
-    
-    deployed_count = 0
-    total_count = len(status)
-    
-    for agent_name, info in sorted(status.items()):
-        if info["auth_ok"]:
-            symbol = "✓"
-            status_text = "SSH key deployed"
-            deployed_count += 1
-        elif info["connected"]:
-            symbol = "⚠"
-            status_text = f"Host up, auth failed: {info['error']}"
-        else:
-            symbol = "✗"
-            status_text = f"Host down: {info['error']}"
-        
-        hostname = info.get("ip", "?")
-        print(f"{symbol} {agent_name:10} ({hostname:15}) - {status_text}")
-        print(f"   Role: {info['role']}")
-        print()
-    
-    print("=" * 60)
-    print(f"Summary: {deployed_count}/{total_count} agents have SSH keys deployed")
-    print("=" * 60)
-    print()
+    to_deploy = agents or status["not_deployed"]
 
-def generate_deployment_script(status):
-    """Generate a deployment script for agents that need keys"""
-    script_lines = [
-        "#!/bin/bash",
-        "# SSH Key Deployment Script",
-        "# Generated by ssh-deployer-automation",
-        f"# Generated: {datetime.now().isoformat()}",
-        "",
-        "set -e",
-        "",
-        "echo 'Starting SSH key deployment...'",
-        "echo ''",
-    ]
-    
-    needs_deployment = []
-    for agent_name, info in status.items():
-        if info["connected"] and not info["auth_ok"]:
-            hostname = AGENTS[agent_name]["hostname"]
-            user = AGENTS[agent_name]["user"]
-            needs_deployment.append((agent_name, hostname, user))
-    
-    if not needs_deployment:
-        script_lines.append("echo 'All agents already have SSH keys deployed!'")
+    if not to_deploy:
+        log_info("All agents have SSH keys deployed. Nothing to do.")
+        return True
+
+    log_step(f"Deploying SSH keys to: {', '.join(to_deploy)}")
+
+    deployer_file = SSH_DEPLOYER / "main.py"
+    if not deployer_file.exists():
+        log_error(f"Deployer tool not found: {deployer_file}")
+        return False
+
+    try:
+        cmd = ["python3", str(deployer_file), "--deploy"]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutes timeout
+        )
+
+        print(result.stdout)
+
+        if result.returncode != 0:
+            log_error(f"Deployment failed: {result.stderr}")
+            return False
+
+        log_info("SSH keys deployed successfully!")
+        return True
+
+    except subprocess.TimeoutExpired:
+        log_error("Deployment timed out")
+        return False
+    except Exception as e:
+        log_error(f"Error deploying keys: {e}")
+        return False
+
+def verify_deployment():
+    """Verify that SSH keys were deployed successfully."""
+    log_step("Verifying SSH key deployment...")
+
+    status = check_status()
+    if not status:
+        return False
+
+    remaining = status["not_deployed"]
+    deployed = status["deployed"]
+
+    if remaining:
+        log_warn(f"Still missing keys for: {', '.join(remaining)}")
+        return False
     else:
-        for agent_name, hostname, user in needs_deployment:
-            script_lines.append(f"echo 'Deploying SSH key to {agent_name} ({user}@{hostname})...'")
-            script_lines.append(f"ssh-copy-id -i ~/.ssh/id_ed25519.pub {user}@{hostname}")
-            script_lines.append("")
-        
-        script_lines.append("echo ''")
-        script_lines.append("echo 'Deployment complete!'")
-        script_lines.append("echo 'Verify deployment with: python3 ~/workspace/tools/ssh-deployer-automation/main.py'")
-    
-    return "\n".join(script_lines)
+        log_info(f"All agents have SSH keys: {', '.join(deployed)}")
+        return True
 
-def save_status_to_memory(status):
-    """Append status to today's memory file"""
-    memory_dir = Path.home() / ".openclaw" / "workspace" / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    
+def save_to_memory(status):
+    """Save deployment status to memory for squad digest."""
+    log_step("Saving status to memory...")
+
+    if not MEMORY_DIR.exists():
+        MEMORY_DIR.mkdir(parents=True)
+
     today = datetime.now().strftime("%Y-%m-%d")
-    memory_file = memory_dir / f"{today}.md"
-    
-    # Count deployed agents
-    deployed = sum(1 for info in status.values() if info["auth_ok"])
-    total = len(status)
-    
-    entry = f"\n## SSH Deployment Status ({datetime.now().strftime('%H:%M UTC')})\n"
-    entry += f"- Deployed: {deployed}/{total} agents\n"
-    
-    for agent_name, info in sorted(status.items()):
-        if info["auth_ok"]:
-            entry += f"  - ✓ {agent_name}: SSH key deployed\n"
-        else:
-            entry += f"  - ✗ {agent_name}: {info['error']}\n"
-    
-    with open(memory_file, 'a') as f:
+    memory_file = MEMORY_DIR / f"{today}.md"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    entry = f"""## SSH Deployment Status ({timestamp})
+
+### Deployment Status
+- Deployed: {', '.join(status.get('deployed', []))}
+- Not Deployed: {', '.join(status.get('not_deployed', []))}
+- Total: {len(status.get('deployed', []))}/{len(AGENTS)} agents
+
+### Details
+```
+{status.get('raw_output', 'N/A')}
+```
+
+"""
+
+    with open(memory_file, "a") as f:
         f.write(entry)
-    
-    print(f"Status saved to {memory_file}")
+
+    log_info(f"Status saved to {memory_file}")
+
+def full_workflow(auto=False):
+    """Run the complete deployment workflow."""
+    log_step("Starting SSH deployment workflow...")
+    print()
+
+    # Check status
+    status = check_status()
+    if not status:
+        log_error("Cannot proceed without status information")
+        return False
+
+    print()
+
+    # Deploy if needed
+    if status["not_deployed"]:
+        success = deploy_keys(auto=auto)
+        if not success:
+            log_error("Deployment failed")
+            return False
+    else:
+        log_info("All agents already have SSH keys")
+
+    print()
+
+    # Wait for propagation
+    log_info("Waiting for SSH key propagation...")
+    import time
+    time.sleep(3)
+
+    print()
+
+    # Verify
+    status_after = check_status()
+    if not status_after:
+        log_error("Could not verify deployment")
+        return False
+
+    success = verify_deployment()
+    print()
+
+    # Save to memory
+    save_to_memory(status_after)
+    print()
+
+    if success:
+        log_info("✅ SSH deployment workflow completed successfully!")
+    else:
+        log_warn("⚠️  Deployment completed with issues")
+
+    return success
 
 def main():
+    """Main entry point."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="SSH Deployment Automation Tool")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--generate-script", action="store_true", help="Generate deployment script")
-    parser.add_argument("--save", action="store_true", help="Save status to memory")
-    parser.add_argument("--watch", action="store_true", help="Watch mode (continuous monitoring)")
+
+    parser = argparse.ArgumentParser(
+        description="Automate SSH key deployment for squad agents",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s check              # Check deployment status
+  %(prog)s deploy             # Deploy to agents needing keys
+  %(prog)s verify             # Verify deployment
+  %(prog)s auto               # Full automated workflow
+  %(prog)s deploy Seneca Galen  # Deploy to specific agents
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Check command
+    check_parser = subparsers.add_parser("check", help="Check deployment status")
+
+    # Deploy command
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy SSH keys")
+    deploy_parser.add_argument(
+        "agents",
+        nargs="*",
+        help="Agents to deploy to (default: all needing keys)"
+    )
+    deploy_parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto-deploy without prompts"
+    )
+
+    # Verify command
+    verify_parser = subparsers.add_parser("verify", help="Verify deployment")
+
+    # Auto command
+    auto_parser = subparsers.add_parser("auto", help="Full automated workflow")
+
     args = parser.parse_args()
-    
-    status = get_deployment_status()
-    
-    if args.json:
-        print_status(status, json_output=True)
-    elif args.generate_script:
-        script = generate_deployment_script(status)
-        print(script)
-        # Save to file
-        script_file = Path.home() / ".openclaw" / "workspace" / "tools" / "ssh-deployer-automation" / "deploy-ssh-keys.sh"
-        with open(script_file, 'w') as f:
-            f.write(script)
-        script_file.chmod(0o755)
-        print(f"\nScript saved to {script_file}")
-    elif args.save:
-        save_status_to_memory(status)
-    elif args.watch:
-        print("Watch mode enabled. Press Ctrl+C to stop...")
-        print()
-        try:
-            while True:
-                status = get_deployment_status()
-                print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-                print_status(status, json_output=False)
-                import time
-                time.sleep(60)
-        except KeyboardInterrupt:
-            print("\nWatch mode stopped.")
+
+    if args.command == "check":
+        check_status()
+    elif args.command == "deploy":
+        deploy_keys(args.agents, auto=args.auto)
+    elif args.command == "verify":
+        verify_deployment()
+    elif args.command == "auto":
+        success = full_workflow(auto=True)
+        sys.exit(0 if success else 1)
     else:
-        print_status(status)
-        
-        # Show next steps
-        connected_no_auth = [name for name, info in status.items() 
-                            if info["connected"] and not info["auth_ok"]]
-        
-        if connected_no_auth:
-            print("To deploy SSH keys to online agents:")
-            print(f"  python3 {sys.argv[0]} --generate-script > deploy.sh")
-            print("  bash deploy.sh")
-            print()
+        # Default: run full workflow in interactive mode
+        full_workflow(auto=False)
 
 if __name__ == "__main__":
     main()
